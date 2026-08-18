@@ -62,7 +62,14 @@ export interface PageContribution {
   entry: string;
 }
 
-/** Отчёт-пресет, который модуль вкладывает в движок отчётов. */
+/**
+ * Отчёт-пресет, который модуль вкладывает в движок отчётов.
+ *
+ * Механизм исполнения (кто и как загружает entry) в Ф0 сознательно не
+ * определён: его спроектирует Ф1 (пилот — модуль отчётов) как аддитивное
+ * расширение — ядро загружает entry и отдаёт реестр вкладов через
+ * `proposed_*`-API контекста. Модули НЕ импортируют чужие entry напрямую.
+ */
 export interface ReportContribution {
   id: string;
   title: string;
@@ -90,7 +97,14 @@ export interface JobContribution {
   intervalSeconds: number;
 }
 
-/** Декларативные вклады модуля. Оболочка рендерит их сама (VS Code contribution points, Odoo). */
+/**
+ * Декларативные вклады модуля. Оболочка рендерит их сама (VS Code
+ * contribution points, Odoo).
+ *
+ * Глобальный ключ любого вклада — `<module>.<id>`: id уникален ВНУТРИ модуля
+ * (проверяет validateManifest), между модулями коллизий нет по построению.
+ * Зафиксировано до Ф1, чтобы реестр отчётов не строился на голых id.
+ */
 export interface ModuleContributions {
   menu?: MenuContribution[];
   pages?: PageContribution[];
@@ -134,6 +148,19 @@ export interface ManifestValidationResult {
 const NAME_RE = /^[a-z][a-z0-9-]*$/;
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
+/**
+ * Путь вклада (entry/pages/reports) обязан оставаться внутри каталога модуля:
+ * относительный, без `..`-сегментов, не абсолютный. Чисто строковая проверка —
+ * контракт не импортирует node:path.
+ */
+function isContainedRelativePath(p: string): boolean {
+  if (p.length === 0) return false;
+  if (p.startsWith('/') || p.startsWith('\\')) return false;
+  if (/^[A-Za-z]:/.test(p)) return false;
+  const segments = p.split(/[\\/]/);
+  return segments.every((s) => s !== '..' && s !== '');
+}
+
 /** Проверка незнакомого JSON на соответствие ModuleManifest. Не бросает. */
 export function validateManifest(raw: unknown): ManifestValidationResult {
   const errors: string[] = [];
@@ -156,6 +183,8 @@ export function validateManifest(raw: unknown): ManifestValidationResult {
   }
   if (typeof m.entry !== 'string' || m.entry.length === 0) {
     errors.push('entry: обязателен — путь до entry-файла относительно корня модуля');
+  } else if (!isContainedRelativePath(m.entry)) {
+    errors.push(`entry: путь обязан оставаться внутри каталога модуля (без «..» и абсолютных путей): ${m.entry}`);
   }
   if (m.dependencies !== undefined) {
     if (!Array.isArray(m.dependencies) || m.dependencies.some((d) => typeof d !== 'string')) {
@@ -182,19 +211,32 @@ function validateContributions(raw: unknown, moduleName: string): string[] {
     return ['contributes: должен быть объектом'];
   }
   const c = raw as Record<string, unknown>;
-  const checkArray = (key: string, itemCheck: (item: Record<string, unknown>, at: string) => void) => {
+  const checkArray = (
+    key: string,
+    uniqueField: string,
+    itemCheck: (item: Record<string, unknown>, at: string) => void,
+  ) => {
     const value = c[key];
     if (value === undefined) return;
     if (!Array.isArray(value)) {
       errors.push(`contributes.${key}: должен быть массивом`);
       return;
     }
+    const seen = new Set<string>();
     value.forEach((item, i) => {
       if (typeof item !== 'object' || item === null) {
         errors.push(`contributes.${key}[${i}]: должен быть объектом`);
         return;
       }
-      itemCheck(item as Record<string, unknown>, `contributes.${key}[${i}]`);
+      const record = item as Record<string, unknown>;
+      const uniqueValue = record[uniqueField];
+      if (typeof uniqueValue === 'string') {
+        if (seen.has(uniqueValue)) {
+          errors.push(`contributes.${key}[${i}].${uniqueField}: дубликат "${uniqueValue}" внутри модуля`);
+        }
+        seen.add(uniqueValue);
+      }
+      itemCheck(record, `contributes.${key}[${i}]`);
     });
   };
   const requireString = (item: Record<string, unknown>, field: string, at: string) => {
@@ -202,31 +244,43 @@ function validateContributions(raw: unknown, moduleName: string): string[] {
       errors.push(`${at}.${field}: обязателен и непуст`);
     }
   };
-  checkArray('menu', (item, at) => {
+  const requireContainedPath = (item: Record<string, unknown>, field: string, at: string) => {
+    requireString(item, field, at);
+    if (typeof item[field] === 'string' && item[field].length > 0 && !isContainedRelativePath(item[field] as string)) {
+      errors.push(`${at}.${field}: путь обязан оставаться внутри каталога модуля (без «..» и абсолютных путей)`);
+    }
+  };
+  checkArray('menu', 'id', (item, at) => {
     requireString(item, 'id', at);
     requireString(item, 'title', at);
     requireString(item, 'pageId', at);
+    if (item.order !== undefined && (typeof item.order !== 'number' || !Number.isFinite(item.order))) {
+      errors.push(`${at}.order: должен быть конечным числом`);
+    }
   });
-  checkArray('pages', (item, at) => {
+  checkArray('pages', 'id', (item, at) => {
     requireString(item, 'id', at);
     requireString(item, 'title', at);
-    requireString(item, 'entry', at);
+    requireContainedPath(item, 'entry', at);
   });
-  checkArray('reports', (item, at) => {
+  checkArray('reports', 'id', (item, at) => {
     requireString(item, 'id', at);
     requireString(item, 'title', at);
-    requireString(item, 'entry', at);
+    requireContainedPath(item, 'entry', at);
   });
-  checkArray('tables', (item, at) => {
+  checkArray('tables', 'name', (item, at) => {
     requireString(item, 'name', at);
     if (typeof item.name === 'string' && moduleName && !item.name.startsWith(`${moduleName.replaceAll('-', '_')}_`)) {
       errors.push(`${at}.name: таблица модуля обязана начинаться с "${moduleName.replaceAll('-', '_')}_"`);
     }
+    if (item.sync !== undefined && typeof item.sync !== 'boolean') {
+      errors.push(`${at}.sync: должен быть boolean (получено ${JSON.stringify(item.sync)})`);
+    }
   });
-  checkArray('jobs', (item, at) => {
+  checkArray('jobs', 'id', (item, at) => {
     requireString(item, 'id', at);
     requireString(item, 'title', at);
-    if (typeof item.intervalSeconds !== 'number' || item.intervalSeconds <= 0) {
+    if (typeof item.intervalSeconds !== 'number' || !Number.isFinite(item.intervalSeconds) || item.intervalSeconds <= 0) {
       errors.push(`${at}.intervalSeconds: положительное число секунд`);
     }
   });
@@ -243,11 +297,19 @@ export type Unsubscribe = () => void;
 /**
  * Шина событий in-process. Интерфейс намеренно асинхронно-нейтральный:
  * позже её можно подложить брокером без правки модулей (концепт v4).
+ *
  * Топики неймспейсятся именем модуля-издателя: `<module>.<event>`.
+ * Ядро ЭНФОРСИТ префикс на publish: модуль может публиковать только в свой
+ * неймспейс; чужой топик отбрасывается с записью в журнал (подписка на любые
+ * топики свободна). События ядра — в неймспейсе `kernel.*`.
+ *
+ * Семантика подписки: каждый вызов subscribe — независимая подписка, даже с
+ * той же функцией-обработчиком; unsubscribe снимает ровно свою. Ошибка (или
+ * reject async-обработчика) изолируется ядром и не глушит остальных.
  */
 export interface EventBus {
   publish(topic: string, payload: unknown): void;
-  subscribe(topic: string, handler: (payload: unknown) => void): Unsubscribe;
+  subscribe(topic: string, handler: (payload: unknown) => void | Promise<void>): Unsubscribe;
 }
 
 /** Журнал модуля (ядро префиксует записи именем модуля). */
