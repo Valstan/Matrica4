@@ -1,0 +1,17 @@
+{
+  "name": "@matrica4/module-sample",
+  "version": "0.1.0",
+  "description": "Модуль-образец: прогон контракта ядра",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@matrica4/contract": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

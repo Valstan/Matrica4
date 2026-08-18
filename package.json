@@ -1,0 +1,21 @@
+{
+  "name": "matrica4",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Матрица 4 — модульное ядро + плагины (D-031). Клиентские релизы парка делаются из MatricaRMZ, не отсюда.",
+  "type": "module",
+  "packageManager": "pnpm@10.26.1",
+  "scripts": {
+    "build": "corepack pnpm -r build",
+    "typecheck": "corepack pnpm -r typecheck",
+    "lint": "eslint . --max-warnings 0",
+    "test": "corepack pnpm -r --no-bail test",
+    "verify": "node scripts/verify-modules.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.0"
+  }
+}

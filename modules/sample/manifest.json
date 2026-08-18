@@ -1,0 +1,13 @@
+{
+  "name": "sample",
+  "version": "0.1.0",
+  "title": "Образец модуля",
+  "coreApi": "0.1.0",
+  "entry": "dist/index.js",
+  "contributes": {
+    "menu": [{ "id": "sample-menu", "title": "Образец", "pageId": "sample-page", "order": 100 }],
+    "pages": [{ "id": "sample-page", "title": "Страница-образец", "entry": "dist/pages/hello.js" }],
+    "tables": [{ "name": "sample_notes", "sync": true }],
+    "jobs": [{ "id": "sample-heartbeat", "title": "Пульс образца", "intervalSeconds": 3600 }]
+  }
+}
