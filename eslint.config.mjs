@@ -50,10 +50,27 @@ export default tseslint.config(
       'no-restricted-imports': [
         'error',
         {
+          paths: [
+            { name: 'node:module', message: 'createRequire — канал обхода границы импортов, запрещён в модулях.' },
+            { name: 'module', message: 'createRequire — канал обхода границы импортов, запрещён в модулях.' },
+          ],
           patterns: [
             { group: ['@matrica4/kernel', '@matrica4/kernel/*'], message: 'Модуль не импортирует ядро — только @matrica4/contract.' },
             { group: ['../../*'], message: 'Модуль не выходит за свой каталог.' },
           ],
+        },
+      ],
+      // require() и вычисляемый import() слепы для no-restricted-imports —
+      // закрываем селекторами (дублируется verifier'ом).
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "CallExpression[callee.name='require']",
+          message: 'require() в модулях запрещён — только статический import @matrica4/contract.',
+        },
+        {
+          selector: "ImportExpression[source.type!='Literal']",
+          message: 'import() с нелитеральным аргументом в модулях запрещён — граница непроверяема.',
         },
       ],
     },

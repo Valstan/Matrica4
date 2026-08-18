@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   CORE_API_VERSION,
@@ -12,7 +12,7 @@ import {
   type ModuleLogger,
   type ModuleManifest,
 } from '@matrica4/contract';
-import { createEventBus } from './eventBus.js';
+import { createEventBus, scopeBusForModule } from './eventBus.js';
 
 export interface KernelOptions {
   /** Каталог с модулями (каждый модуль — папка с manifest.json). */
@@ -47,6 +47,16 @@ interface LoadedModule {
 
 const ACTIVATING_MARKER = 'activating.json';
 
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const key of Object.getOwnPropertyNames(value)) {
+      deepFreeze((value as Record<string, unknown>)[key]);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
 /**
  * Ядро Ф0: скан модулей → валидация → топологический порядок → активация
  * с safe mode. Горячей выгрузки нет: обновление модуля = рестарт процесса.
@@ -54,11 +64,14 @@ const ACTIVATING_MARKER = 'activating.json';
  * Safe mode — двухслойный (OBS-модель):
  * 1) activate() бросил → модуль failed, ядро живёт дальше без него;
  * 2) activate() УРОНИЛ процесс (маркер activating остался с прошлого запуска)
- *    → на этом запуске виновник в карантине и не грузится вовсе.
+ *    → на этом запуске виновник в карантине и не грузится вовсе; маркер
+ *    снимается сразу при чтении, чтобы карантин не стал вечным.
  */
 export class Kernel {
   private readonly opts: KernelOptions;
   private readonly modules = new Map<string, LoadedModule>();
+  /** Отвергнутые до загрузки (битые манифесты, коллизии имён) — отдельно от принятых. */
+  private rejected: ModuleReport[] = [];
   private readonly logSink: (line: string) => void;
   private readonly bus = createEventBus((topic, err) => {
     this.logSink(`[kernel] подписчик топика ${topic} бросил: ${String(err)}`);
@@ -74,16 +87,23 @@ export class Kernel {
     return this.bus;
   }
 
-  /** Имя модуля, чей activate уронил прошлый запуск (карантин), либо null. */
-  private readCrashedModule(): string | null {
+  /**
+   * Имя модуля, чей activate уронил прошлый запуск, либо null.
+   * Маркер удаляется СРАЗУ при чтении: карантин действует ровно один запуск,
+   * даже если в этом запуске ни один другой модуль не активируется.
+   */
+  private consumeCrashedModule(): string | null {
     const markerPath = join(this.opts.stateDir, ACTIVATING_MARKER);
     if (!existsSync(markerPath)) return null;
+    let crashed: string | null = null;
     try {
       const parsed = JSON.parse(readFileSync(markerPath, 'utf8')) as { module?: unknown };
-      return typeof parsed.module === 'string' ? parsed.module : null;
+      crashed = typeof parsed.module === 'string' ? parsed.module : null;
     } catch {
-      return null;
+      crashed = null;
     }
+    this.clearActivatingMarker();
+    return crashed;
   }
 
   private writeActivatingMarker(name: string): void {
@@ -95,7 +115,7 @@ export class Kernel {
     rmSync(join(this.opts.stateDir, ACTIVATING_MARKER), { force: true });
   }
 
-  /** Скан + валидация манифестов. Возвращает отчёты по отвергнутым. */
+  /** Скан + валидация манифестов. Отказы копятся в this.rejected, принятые — в this.modules. */
   private discover(): void {
     const root = resolve(this.opts.modulesDir);
     if (!existsSync(root)) return;
@@ -108,35 +128,31 @@ export class Kernel {
       try {
         raw = JSON.parse(readFileSync(manifestPath, 'utf8'));
       } catch (err) {
-        this.reject(entry.name, dir, `manifest.json не парсится: ${String(err)}`);
+        this.reject(entry.name, `manifest.json не парсится: ${String(err)}`);
         continue;
       }
       const check = validateManifest(raw);
       if (!check.ok) {
-        this.reject(entry.name, dir, `манифест невалиден: ${check.errors.join('; ')}`);
+        this.reject(entry.name, `манифест невалиден: ${check.errors.join('; ')}`);
         continue;
       }
       const manifest = raw as ModuleManifest;
       if (this.modules.has(manifest.name)) {
-        this.reject(entry.name, dir, `имя ${manifest.name} уже занято другим модулем`);
+        // Никогда не трогаем уже принятую запись — отвергаем НОВОГО претендента.
+        this.reject(`${manifest.name} (папка ${entry.name})`, `имя ${manifest.name} уже занято другим модулем`);
         continue;
       }
       if (compareCoreVersions(CORE_API_VERSION, manifest.coreApi) < 0) {
-        this.reject(manifest.name, dir, `требует ядро ≥ ${manifest.coreApi}, текущее ${CORE_API_VERSION}`);
+        this.reject(manifest.name, `требует ядро ≥ ${manifest.coreApi}, текущее ${CORE_API_VERSION}`);
         continue;
       }
       this.modules.set(manifest.name, { manifest, dir, state: 'skipped' });
     }
   }
 
-  private reject(name: string, dir: string, reason: string): void {
-    this.logSink(`[kernel] модуль ${name} отвергнут: ${reason}`);
-    this.modules.set(name, {
-      manifest: { name, version: '0.0.0', title: name, coreApi: '0.0.0', entry: '' },
-      dir,
-      state: 'skipped',
-      reason,
-    });
+  private reject(label: string, reason: string): void {
+    this.logSink(`[kernel] модуль ${label} отвергнут: ${reason}`);
+    this.rejected.push({ name: label, state: 'skipped', reason });
   }
 
   /** Топологический порядок по dependencies; циклы и неизвестные зависимости → skipped. */
@@ -194,7 +210,10 @@ export class Kernel {
   async start(): Promise<ModuleReport[]> {
     if (this.started) throw new Error('kernel уже запущен');
     this.started = true;
-    const quarantined = this.readCrashedModule();
+    // Рестарт после stop(): каждый запуск строит состояние заново.
+    this.modules.clear();
+    this.rejected = [];
+    const quarantined = this.consumeCrashedModule();
     this.discover();
     const orderedNames = this.order();
 
@@ -216,15 +235,29 @@ export class Kernel {
         mod.reason = `зависимость ${badDep} не активна`;
         continue;
       }
+      // Рантайм-граница: entry обязан остаться внутри каталога модуля
+      // (validateManifest уже отверг «..» строкой; здесь — по resolved-пути).
+      const moduleRoot = resolve(mod.dir);
+      const entryPath = resolve(mod.dir, mod.manifest.entry);
+      if (!entryPath.startsWith(moduleRoot + sep)) {
+        mod.state = 'skipped';
+        mod.reason = `entry ${mod.manifest.entry} выходит за каталог модуля`;
+        this.logSink(`[kernel] ${name} отвергнут: ${mod.reason}`);
+        continue;
+      }
       const ctx: ModuleContext = {
-        manifest: mod.manifest,
+        // Модуль получает замороженную копию — рантайм-мутация «декларативных»
+        // вкладов мимо CI-гейта невозможна.
+        manifest: deepFreeze(structuredClone(mod.manifest)),
         coreApiVersion: CORE_API_VERSION,
-        events: this.bus,
+        events: scopeBusForModule(this.bus, name, (topic) => {
+          this.logSink(`[kernel] ${name} попытался публиковать в чужой топик ${topic} — отброшено`);
+        }),
         log: this.makeLogger(name),
       };
       try {
         this.writeActivatingMarker(name);
-        const entryUrl = pathToFileURL(join(mod.dir, mod.manifest.entry)).href;
+        const entryUrl = pathToFileURL(entryPath).href;
         const imported = (await import(entryUrl)) as { default?: ModuleActivate };
         if (typeof imported.default !== 'function') {
           throw new Error(`entry ${mod.manifest.entry} не экспортирует default-функцию activate`);
@@ -240,12 +273,15 @@ export class Kernel {
         this.clearActivatingMarker();
       }
     }
+    this.bus.publish('kernel.started', {
+      modules: [...this.modules.values()].map((m) => ({ name: m.manifest.name, state: m.state })),
+    });
     return this.report();
   }
 
-  /** Здоровье и состояние всех обнаруженных модулей. */
+  /** Здоровье и состояние всех обнаруженных модулей (включая отвергнутые до загрузки). */
   report(): ModuleReport[] {
-    return [...this.modules.values()].map((mod) => {
+    const loaded = [...this.modules.values()].map((mod) => {
       const base: ModuleReport = { name: mod.manifest.name, state: mod.state };
       if (mod.reason !== undefined) base.reason = mod.reason;
       if (mod.state === 'active') {
@@ -257,6 +293,7 @@ export class Kernel {
       }
       return base;
     });
+    return [...loaded, ...this.rejected];
   }
 
   async stop(): Promise<void> {
@@ -268,6 +305,11 @@ export class Kernel {
       } catch (err) {
         this.logSink(`[kernel] ${mod.manifest.name} бросил в deactivate: ${String(err)}`);
       }
+      // После остановки инстанс мёртв: report() не должен показывать active
+      // и дёргать health() деактивированного модуля.
+      mod.state = 'skipped';
+      mod.reason = 'ядро остановлено';
+      delete mod.instance;
     }
     this.started = false;
   }

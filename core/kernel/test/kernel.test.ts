@@ -93,18 +93,19 @@ describe('Kernel', () => {
     writeModule(
       modulesDir,
       'base-mod',
-      `export default (ctx) => { ctx.events.publish('order', 'base-mod'); return {}; };`,
+      `export default (ctx) => { ctx.events.publish('base-mod.up', 'base-mod'); return {}; };`,
     );
     writeModule(
       modulesDir,
       'child-ok',
-      `export default (ctx) => { ctx.events.publish('order', 'child-ok'); return {}; };`,
+      `export default (ctx) => { ctx.events.publish('child-ok.up', 'child-ok'); return {}; };`,
       { dependencies: ['base-mod'] },
     );
     writeModule(modulesDir, 'broken', `export default () => { throw new Error('no'); };`);
     writeModule(modulesDir, 'child-of-broken', OK_MODULE, { dependencies: ['broken'] });
     const kernel = new Kernel({ modulesDir, stateDir, log: () => {} });
-    kernel.events.subscribe('order', (name) => order.push(name as string));
+    kernel.events.subscribe('base-mod.up', (name) => order.push(name as string));
+    kernel.events.subscribe('child-ok.up', (name) => order.push(name as string));
     const report = await kernel.start();
     const byName = Object.fromEntries(report.map((r) => [r.name, r]));
     expect(order.indexOf('base-mod')).toBeLessThan(order.indexOf('child-ok'));
@@ -158,17 +159,18 @@ describe('Kernel', () => {
     writeModule(
       modulesDir,
       'first',
-      `export default (ctx) => ({ deactivate: () => ctx.events.publish('down', 'first') });`,
+      `export default (ctx) => ({ deactivate: () => ctx.events.publish('first.down', 'first') });`,
     );
     writeModule(
       modulesDir,
       'second',
-      `export default (ctx) => ({ deactivate: () => ctx.events.publish('down', 'second') });`,
+      `export default (ctx) => ({ deactivate: () => ctx.events.publish('second.down', 'second') });`,
       { dependencies: ['first'] },
     );
     const kernel = new Kernel({ modulesDir, stateDir, log: () => {} });
     const down: string[] = [];
-    kernel.events.subscribe('down', (name) => down.push(name as string));
+    kernel.events.subscribe('first.down', (name) => down.push(name as string));
+    kernel.events.subscribe('second.down', (name) => down.push(name as string));
     await kernel.start();
     await kernel.stop();
     expect(down).toEqual(['second', 'first']);
